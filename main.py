@@ -14,10 +14,28 @@ PORT = int(os.getenv('PORT', 5050))
 
 SYSTEM_MESSAGE = (
     "You are a helpful and bubbly AI assistant who loves to chat about "
-    "the order that the patient has ordered. Start with asking dob and name to verify and then proceed."
-    "Don't say lots of words. Keep it simple."
+    "the order that the patient has ordered. Ask the contact number of patient."
+    "Once you get contact number, you can get patient info and orders information for this patient and use that to answer questions."
+    "As soon as you get the details, first start by telling them about their medication name."
 )
 
+tools = [
+    {
+        "type": "function",
+        "name": "get_patient_info",
+        "description": "Returns the patient info of the patient and orders information for this patient",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "contact_number": {
+                    "type": "string",
+                    "description": "The contact number of patient"
+                }
+            },
+            "required": ["contact_number"]
+        }
+    }
+]
 extra_context = {
     "patient_id": 2492302,
     "name": "Rahul Garg",
@@ -187,6 +205,13 @@ extra_context = {
     ]
 }
 
+
+def get_patient_info(contact_number):
+    return json.dumps(extra_context)
+
+
+stream_sid_to_call_sid = {}
+
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'response.content.done', 'rate_limits.updated', 'response.done',
@@ -196,6 +221,38 @@ LOG_EVENT_TYPES = [
 app = FastAPI()
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
+
+
+from twilio.rest import Client
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+HUMAN_AGENT_PHONE = os.getenv("HUMAN_AGENT_PHONE")  # e.g., "+14155552671"
+
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+async def escalate_call(stream_sid):
+    try:
+        # Convert stream_sid to Call SID by mapping or logging earlier
+        call_sid = stream_sid_to_call_sid.get(stream_sid)
+        if not call_sid:
+            print("Unable to find call SID for escalation.")
+            return
+
+        # Redirect Twilio call to /connect-human
+        twilio_client.calls(call_sid).update(
+            url="https://6257-49-206-130-117.ngrok-free.app/connect-human", method="POST"
+        )
+        print("Call redirected to human agent.")
+    except Exception as e:
+        print(f"Failed to escalate call: {e}")
+
+@app.post("/connect-human")
+async def connect_human():
+    response = VoiceResponse()
+    response.say("Please hold while we connect you to a human agent.")
+    response.dial(HUMAN_AGENT_PHONE)
+    return HTMLResponse(content=str(response), media_type="application/xml")
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -251,8 +308,9 @@ async def handle_media_stream(websocket: WebSocket):
 
                         elif data['event'] == 'start':
                             stream_sid = data['start']['streamSid']
+                            call_sid = data['start']['callSid']
+                            stream_sid_to_call_sid[stream_sid] = call_sid
                             print(f"Incoming stream started: {stream_sid}")
-
                 except WebSocketDisconnect:
                     print("Client disconnected.")
                     if not openai_ws.closed:
@@ -271,6 +329,44 @@ async def handle_media_stream(websocket: WebSocket):
                             if response['type'] == 'session.updated':
                                 print("Session updated successfully:", response)
 
+                            if response['type'] == 'response.done':
+                                output_items = response.get('response', {}).get('output', [])
+                                for item in output_items:
+                                    if item.get('type') == 'message' and item.get('status') == 'completed':
+                                        for content_block in item.get('content', []):
+                                            if content_block.get('type') == 'audio':
+                                                transcript = content_block.get('transcript', '').lower()
+                                                print("Transcript received:", transcript)
+
+                                                # Trigger condition: user wants human agent
+                                                if "talk to an agent" in transcript or "human" in transcript or "representative" in transcript:
+                                                    print("Escalation trigger detected.")
+                                                    call_sid = stream_sid_to_call_sid.get(stream_sid)
+                                                    if call_sid:
+                                                        print("Escalating call to human agent...")
+                                                        from twilio.rest import Client
+                                                        twilio_client = Client()  # Assumes credentials set in env
+                                                        twilio_client.calls(call_sid).update(
+                                                            url="https://6257-49-206-130-117.ngrok-free.app/connect-human",
+                                                            # Replace with your endpoint
+                                                            method="POST"
+                                                        )
+                                                    else:
+                                                        print(f"No call_sid found for stream_sid: {stream_sid}")
+                                    if item.get('type') == 'function_call':
+                                        if item.get('name') == 'get_patient_info':
+                                            conversation_item = {
+                                              "type": "conversation.item.create",
+                                              "item": {
+                                                "type": "function_call_output",
+                                                "call_id": item.get('call_id'),
+                                                "output": get_patient_info("1234")
+                                              }
+                                            }
+                                            await openai_ws.send_str(json.dumps(conversation_item))
+
+
+
                             if response['type'] == 'response.audio.delta' and response.get('delta'):
                                 try:
                                     audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
@@ -284,6 +380,24 @@ async def handle_media_stream(websocket: WebSocket):
                                     await websocket.send_json(audio_delta)
                                 except Exception as e:
                                     print(f"Error processing audio data: {e}")
+
+                            # if response['type'] == 'tool_calls':
+                            #     for tool_call in response.get("tool_calls", []):
+                            #         tool_name = tool_call["function"]["name"]
+                            #         arguments = json.loads(tool_call["function"]["arguments"])
+                            #         print(tool_name)
+                            #
+                            #         if tool_name == "get_patient_info":
+                            #             result = get_patient_info(**arguments)
+                            #             print(result)
+                            #
+                            #             await openai_ws.send_str(json.dumps({
+                            #                 "type": "tool_response",
+                            #                 "tool_response": {
+                            #                     "tool_call_id": tool_call["id"],
+                            #                     "content": result  # Just a string
+                            #                 }
+                            #             }))
 
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             print(f"OpenAI WebSocket error: {openai_ws.exception()}")
@@ -302,9 +416,11 @@ async def send_session_update_aiohttp(openai_ws):
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE + str(extra_context),
+            "instructions": SYSTEM_MESSAGE,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
+            "tools": tools,
+            "tool_choice": "auto",
         }
     }
     print('Sending session update:', json.dumps(session_update))
